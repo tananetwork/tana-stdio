@@ -1,0 +1,44 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Update package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION=$(echo ${{ github.ref_name }} | sed 's/^v//')
+          jq ".version = \"$VERSION\"" package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+      - name: Publish to npm
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > .npmrc
+          npm publish --access public
+
+      - name: Publish to GitHub Packages
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > .npmrc
+          jq '.publishConfig.registry = "https://npm.pkg.github.com"' package.json > package.json.tmp
+          mv package.json.tmp package.json
+          npm publish
