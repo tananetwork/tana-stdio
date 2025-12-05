@@ -30,10 +30,15 @@ export function error(action: string, message: string): void {
 
 /**
  * Log a warning
- * [action] message (cyan bracket, yellow message)
+ * ● [name] message - if message provided
+ * ● message - if only one arg
  */
-export function warn(action: string, message: string): void {
-  console.log(`${chalk.cyan(`[${action}]`)} ${chalk.yellow(message)}`)
+export function warn(name: string, message?: string): void {
+  if (message !== undefined) {
+    console.log(`${chalk.yellow('●')} ${chalk.cyan(`[${name}]`)} ${message}`)
+  } else {
+    console.log(`${chalk.yellow('●')} ${name}`)
+  }
 }
 
 /**
