@@ -112,6 +112,31 @@ export function fatal(action: string, message: string): never {
   return process.exit(1)
 }
 
+/**
+ * Suggest a next step
+ *   → description: command
+ */
+export function nextStep(description: string, command: string): void {
+  console.log(`  ${chalk.gray('→')} ${description}: ${chalk.cyan(command)}`)
+}
+
+/**
+ * Suggest multiple next steps
+ */
+export function nextSteps(steps: Array<{ description: string; command: string }>): void {
+  for (const step of steps) {
+    nextStep(step.description, step.command)
+  }
+}
+
+/**
+ * Diagnostic warning - yellow indicator with issue description
+ * ⚠ [component] message
+ */
+export function diagnostic(component: string, message: string): void {
+  console.log(`${chalk.yellow('⚠')} ${chalk.cyan(`[${component}]`)} ${chalk.yellow(message)}`)
+}
+
 // Namespace export for cleaner imports
 export const out = {
   log,
@@ -126,6 +151,9 @@ export const out = {
   hint,
   detail,
   fatal,
+  nextStep,
+  nextSteps,
+  diagnostic,
 }
 
 // Default export
