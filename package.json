@@ -1,0 +1,43 @@
+{
+  "name": "@tananetwork/stdio",
+  "version": "0.1.0",
+  "description": "Terminal output utilities for Tana projects",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.3.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tananetwork/tana-stdio.git"
+  },
+  "keywords": [
+    "tana",
+    "cli",
+    "terminal",
+    "output"
+  ],
+  "author": "Tana Network",
+  "license": "MIT",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  }
+}
