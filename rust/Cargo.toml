@@ -1,0 +1,15 @@
+[package]
+name = "tana-stdio"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal output utilities for Tana projects"
+license = "MIT"
+repository = "https://github.com/tananetwork/tana-stdio"
+keywords = ["tana", "cli", "terminal", "logging"]
+categories = ["command-line-interface", "development-tools"]
+authors = ["Tana Network"]
+
+[dependencies]
+
+[features]
+default = []

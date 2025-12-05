@@ -2,3 +2,7 @@ node_modules/
 dist/
 *.log
 .npmrc
+
+# Rust
+rust/target/
+rust/Cargo.lock
