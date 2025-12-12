@@ -11,6 +11,25 @@
  */
 
 import chalk from 'chalk'
+import figlet from 'figlet'
+
+// Brand color - matches tana.network website (oklch 0.65 0.2 220)
+const BRAND_BLUE = '\x1b[38;5;39m'
+const BOLD = '\x1b[1m'
+const RESET = '\x1b[0m'
+
+/**
+ * Generate ASCII art banner in Tana brand style
+ * Uses "Terrace" font with brand blue color
+ *
+ * @example
+ * const banner = ascii('box')
+ * console.log(banner)
+ */
+export function ascii(text: string): string {
+  const art = figlet.textSync(text, { font: 'Terrace' }).trimEnd()
+  return `${BRAND_BLUE}${BOLD}\n${art}${RESET}\n`
+}
 
 /**
  * Log an action with a value
@@ -139,6 +158,7 @@ export function diagnostic(component: string, message: string): void {
 
 // Namespace export for cleaner imports
 export const out = {
+  ascii,
   log,
   error,
   warn,
