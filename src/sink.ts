@@ -42,6 +42,8 @@ interface LogConfig {
   sink?: string
   token?: string
   spoolPath: string
+  /** Allow http:// sinks (trusted tailnet ingest). Off by default. */
+  insecure: boolean
   stdout: boolean
   flushSecs: number
   capBytes: number
@@ -102,6 +104,7 @@ function loadConfig(): LogConfig {
     sink: nonemptyEnv('DEKA_LOG_SINK'),
     token: nonemptyEnv('DEKA_LOG_TOKEN'),
     spoolPath: nonemptyEnv('DEKA_LOG_SPOOL') ?? DEFAULT_SPOOL_PATH,
+    insecure: process.env.DEKA_LOG_INSECURE === '1',
     stdout: process.env.DEKA_LOG_STDOUT === '1',
     flushSecs: Math.max(1, envU64('DEKA_LOG_FLUSH_SECS', DEFAULT_FLUSH_SECS)),
     capBytes: Math.max(1, envU64('DEKA_LOG_SPOOL_CAP_MB', DEFAULT_CAP_MB)) * 1024 * 1024,
@@ -137,6 +140,7 @@ export class LogSink {
   private readonly config: LogConfig
   private flushPending = false
   private droppedCount = 0
+  private insecureWarned = false
   private timer?: ReturnType<typeof setInterval>
 
   constructor(config: LogConfig) {
@@ -176,9 +180,10 @@ export class LogSink {
   append(level: string, component: string, action: string, msg: string): void {
     if (this.config.sink === undefined) return
 
+    const redactedMsg = redactSensitive(msg, this.config.token)
     let line: string
     try {
-      line = JSON.stringify(this.buildRecord(level, component, action, msg)) + '\n'
+      line = JSON.stringify(this.buildRecord(level, component, action, redactedMsg)) + '\n'
     } catch {
       return
     }
@@ -260,6 +265,18 @@ export class LogSink {
   async flushOnce(): Promise<boolean> {
     const sink = this.config.sink
     if (sink === undefined) return false
+
+    // Block http:// egress unless DEKA_LOG_INSECURE=1 (trusted tailnet only).
+    // The bearer token must never travel over plain HTTP to an unvalidated host.
+    if (sink.startsWith('http://') && !this.config.insecure) {
+      if (!this.insecureWarned) {
+        this.insecureWarned = true
+        process.stderr.write(
+          '[stdio] warn: http:// sink refused; set DEKA_LOG_INSECURE=1 for trusted tailnet ingest\n',
+        )
+      }
+      return false
+    }
 
     let raw: Buffer
     try {
@@ -363,6 +380,7 @@ export function _sinkForTest(config: Partial<LogConfig> & { spoolPath: string })
   const full: LogConfig = {
     sink: undefined,
     token: undefined,
+    insecure: true, // test servers speak http://
     stdout: false,
     flushSecs: 1,
     capBytes: 1024 * 1024,
@@ -375,4 +393,56 @@ export function _sinkForTest(config: Partial<LogConfig> & { spoolPath: string })
     ...config,
   }
   return new LogSink(full)
+}
+
+// ---------------------------------------------------------------------------
+// Sensitive-data redaction — applied to every msg before spooling or egress.
+// ---------------------------------------------------------------------------
+
+function redactAfterPrefixRegex(s: string, prefix: string): string {
+  const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return s.replace(
+    new RegExp(`${escaped}[^\\s"',)\\}\\]]+`, 'g'),
+    `${prefix}[REDACTED]`,
+  )
+}
+
+export function redactSensitive(msg: string, logToken: string | undefined): string {
+  let s = msg
+
+  // DEKA_LOG_TOKEN must never appear in the spool.
+  if (logToken && logToken.length > 0) {
+    s = s.split(logToken).join('[REDACTED]')
+  }
+
+  // Bearer tokens
+  s = redactAfterPrefixRegex(s, 'Bearer ')
+
+  // JWT: eyJ<base64url>.<base64url>.<base64url>
+  s = s.replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[REDACTED_JWT]')
+
+  // Stripe keys
+  for (const prefix of ['sk_live_', 'sk_test_', 'rk_', 'whsec_']) {
+    s = redactAfterPrefixRegex(s, prefix)
+  }
+
+  // AWS access key IDs
+  s = s.replace(/AKIA[0-9A-Z]{16}/g, '[REDACTED]')
+
+  // Sensitive key=value pairs
+  s = s.replace(/(password|secret|api_key|token)=[^\s&"',)\}]*/gi, '$1=[REDACTED]')
+
+  // Long hex strings (>=32 hex chars contiguous)
+  s = s.replace(/[0-9a-fA-F]{32,}/g, '[REDACTED]')
+
+  // Long base64 strings (>=32 chars containing at least one non-hex char)
+  s = s.replace(/[A-Za-z0-9+/=]{32,}/g, (m) => {
+    if (/[A-Z+/=]/.test(m)) return '[REDACTED]'
+    return m
+  })
+
+  // Email addresses (PII)
+  s = s.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[REDACTED]')
+
+  return s
 }

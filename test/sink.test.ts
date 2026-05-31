@@ -135,3 +135,55 @@ test('unreachable sink retains lines (flush returns false)', async () => {
   expect(ok).toBe(false)
   expect(readLines(spoolPath).length).toBe(1)
 })
+
+import { redactSensitive } from '../src/sink.ts'
+
+test('redactSensitive strips Bearer token', () => {
+  const out = redactSensitive('Authorization: Bearer abc123XYZ and more', undefined)
+  expect(out).not.toContain('abc123XYZ')
+  expect(out).toContain('Bearer [REDACTED]')
+})
+
+test('redactSensitive strips JWT', () => {
+  const jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
+  // Test JWT outside a key=value context (token= would also catch it via key=value pass).
+  const out = redactSensitive(`auth header contains ${jwt} end`, undefined)
+  expect(out).not.toContain('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9')
+  expect(out).toContain('[REDACTED_JWT]')
+})
+
+test('redactSensitive strips Stripe and AWS keys', () => {
+  const msg = 'stripe sk_live_abc123 and AKIAIOSFODNN7EXAMPLE and whsec_xyz'
+  const out = redactSensitive(msg, undefined)
+  expect(out).not.toContain('sk_live_abc123')
+  expect(out).not.toContain('AKIAIOSFODNN7EXAMPLE')
+  expect(out).not.toContain('whsec_xyz')
+})
+
+test('redactSensitive strips log token', () => {
+  const out = redactSensitive('value=mysupersecrettoken123 here', 'mysupersecrettoken123')
+  expect(out).not.toContain('mysupersecrettoken123')
+})
+
+test('redactSensitive strips email addresses', () => {
+  const out = redactSensitive('contact user@example.com for help', undefined)
+  expect(out).not.toContain('user@example.com')
+  expect(out).toContain('[REDACTED]')
+})
+
+test('redactSensitive strips long hex', () => {
+  const sha = 'a3f1e6b2c8d04e17f5a9b3c2d4e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4'
+  const out = redactSensitive(`hash=${sha}`, undefined)
+  expect(out).not.toContain(sha)
+  expect(out).toContain('[REDACTED]')
+})
+
+test('http sink blocked when insecure not set', async () => {
+  const spoolPath = tmpSpool()
+  const sink = _sinkForTest({ spoolPath, sink: 'http://127.0.0.1:9', insecure: false })
+  sink.append('info', 'test', 'check', 'kept in spool')
+  const ok = await sink.flushOnce()
+  expect(ok).toBe(false)
+  // data stays in spool
+  expect(readLines(spoolPath).length).toBeGreaterThan(0)
+})

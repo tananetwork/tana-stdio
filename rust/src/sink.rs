@@ -13,6 +13,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{thread, time::Duration};
 
@@ -37,6 +38,8 @@ pub(crate) struct LogConfig {
     pub flush_secs: u64,
     /// Spool size cap in bytes.
     pub cap_bytes: u64,
+    /// Allow http:// sinks (trusted tailnet ingest). Off by default.
+    pub insecure: bool,
     // ---- metadata enrichment (attached to every record) ----
     pub host: String,
     pub user: String,
@@ -71,6 +74,8 @@ pub(crate) struct LogSink {
     flush_pending: Mutex<bool>,
     /// Running total of dropped lines due to the spool cap.
     dropped_count: Mutex<u64>,
+    /// Ensures we warn only once about a blocked http:// sink.
+    insecure_warned: AtomicBool,
 }
 
 impl LogConfig {
@@ -81,6 +86,7 @@ impl LogConfig {
             spool_path: env::var("DEKA_LOG_SPOOL")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from(DEFAULT_SPOOL_PATH)),
+            insecure: env::var("DEKA_LOG_INSECURE").map(|v| v == "1").unwrap_or(false),
             stdout: env::var("DEKA_LOG_STDOUT").map(|v| v == "1").unwrap_or(false),
             flush_secs: env_u64("DEKA_LOG_FLUSH_SECS", DEFAULT_FLUSH_SECS).max(1),
             cap_bytes: env_u64("DEKA_LOG_SPOOL_CAP_MB", DEFAULT_CAP_MB)
@@ -103,6 +109,7 @@ impl LogSink {
             spool_lock: Mutex::new(()),
             flush_pending: Mutex::new(false),
             dropped_count: Mutex::new(0),
+            insecure_warned: AtomicBool::new(false),
         });
         if sink.config.sink.is_some() {
             Self::spawn_flusher(Arc::clone(&sink));
@@ -139,7 +146,8 @@ impl LogSink {
             return;
         }
 
-        let record = self.build_record(level, component, action, msg);
+        let redacted = redact_sensitive(msg, self.config.token.as_deref());
+        let record = self.build_record(level, component, action, &redacted);
         let Ok(mut line) = serde_json::to_string(&record) else {
             return;
         };
@@ -172,6 +180,15 @@ impl LogSink {
         let Some(sink) = self.config.sink.as_deref() else {
             return false;
         };
+
+        // Block http:// egress unless DEKA_LOG_INSECURE=1 (trusted tailnet only).
+        // The token must never travel over plain HTTP to an unvalidated host.
+        if sink.starts_with("http://") && !self.config.insecure {
+            if !self.insecure_warned.swap(true, Ordering::Relaxed) {
+                eprintln!("[stdio] warn: http:// sink refused; set DEKA_LOG_INSECURE=1 for trusted tailnet ingest");
+            }
+            return false;
+        }
 
         // Snapshot a whole-line prefix of the spool under the lock.
         let batch = {
@@ -411,6 +428,7 @@ mod tests {
             sink: Some("http://127.0.0.1:9".to_string()),
             token: Some("test-token".to_string()),
             spool_path,
+            insecure: true, // test server speaks http://
             stdout: false,
             flush_secs: 1,
             cap_bytes: 1024 * 1024,
@@ -429,6 +447,7 @@ mod tests {
             spool_lock: Mutex::new(()),
             flush_pending: Mutex::new(false),
             dropped_count: Mutex::new(0),
+            insecure_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -588,4 +607,322 @@ mod tests {
         assert!(sink.stdout_enabled());
         assert!(!path.exists());
     }
+
+    #[test]
+    fn http_sink_blocked_when_insecure_not_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spool.ndjson");
+        let mut config = test_config(path.clone());
+        config.insecure = false;
+        config.sink = Some("http://127.0.0.1:9".to_string());
+        let sink = make_sink(config);
+        sink.append("info", "test", "check", "kept in spool");
+
+        // flush must be refused (http + insecure=false)
+        assert!(!sink.flush_once());
+        // spool data must be retained
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("kept in spool"));
+    }
+
+    #[test]
+    fn redact_sensitive_strips_bearer_and_jwt() {
+        let msg = "got Authorization: Bearer sk_abc123XYZ token=secret123 and eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c done";
+        let out = redact_sensitive(msg, None);
+        assert!(!out.contains("sk_abc123XYZ"), "bearer value leaked: {out}");
+        assert!(!out.contains("secret123"), "token value leaked: {out}");
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"), "jwt leaked: {out}");
+        assert!(out.contains("Bearer [REDACTED]"));
+        assert!(out.contains("[REDACTED_JWT]"));
+    }
+
+    #[test]
+    fn redact_sensitive_strips_stripe_and_aws() {
+        let msg = "stripe sk_live_abcDEF123456 aws AKIAIOSFODNN7EXAMPLE and rk_live_xyz";
+        let out = redact_sensitive(msg, None);
+        assert!(!out.contains("sk_live_abcDEF123456"), "{out}");
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "{out}");
+        assert!(!out.contains("rk_live_xyz"), "{out}");
+    }
+
+    #[test]
+    fn redact_sensitive_strips_log_token() {
+        let msg = "token value is mysupersecrettoken123 here";
+        let out = redact_sensitive(msg, Some("mysupersecrettoken123"));
+        assert!(!out.contains("mysupersecrettoken123"), "{out}");
+    }
+
+    #[test]
+    fn redact_sensitive_strips_email() {
+        let msg = "contact user@example.com for help";
+        let out = redact_sensitive(msg, None);
+        assert!(!out.contains("user@example.com"), "{out}");
+        assert!(out.contains("[REDACTED]"), "{out}");
+    }
+
+    #[test]
+    fn redact_sensitive_strips_long_hex() {
+        let sha = "a3f1e6b2c8d04e17f5a9b3c2d4e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4";
+        let msg = format!("hash={sha}");
+        let out = redact_sensitive(&msg, None);
+        assert!(!out.contains(sha), "{out}");
+        assert!(out.contains("[REDACTED]"), "{out}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sensitive-data redaction — applied to every msg before spooling or egress.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn redact_sensitive(msg: &str, log_token: Option<&str>) -> String {
+    let mut s = msg.to_owned();
+
+    // The DEKA_LOG_TOKEN value itself must never appear in the spool.
+    if let Some(tok) = log_token.filter(|t| !t.is_empty()) {
+        s = s.replace(tok, "[REDACTED]");
+    }
+
+    s = redact_after_prefix(&s, "Bearer ");
+    s = redact_jwt(&s);
+
+    for prefix in ["sk_live_", "sk_test_", "rk_", "whsec_"] {
+        s = redact_after_prefix(&s, prefix);
+    }
+
+    s = redact_aws_akid(&s);
+
+    for key in ["password=", "secret=", "api_key=", "token="] {
+        s = redact_key_eq_value(&s, key);
+    }
+
+    s = redact_long_hex(&s);
+    s = redact_long_base64(&s);
+    s = redact_emails(&s);
+
+    s
+}
+
+/// Strip everything after `prefix` up to the next whitespace/delimiter.
+fn redact_after_prefix(s: &str, prefix: &str) -> String {
+    if !s.contains(prefix) {
+        return s.to_owned();
+    }
+    let mut result = String::with_capacity(s.len());
+    let mut remaining = s;
+    while let Some(pos) = remaining.find(prefix) {
+        result.push_str(&remaining[..pos + prefix.len()]);
+        let after = &remaining[pos + prefix.len()..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ')' | '}' | ']'))
+            .unwrap_or(after.len());
+        if end > 0 {
+            result.push_str("[REDACTED]");
+        }
+        remaining = &after[end..];
+    }
+    result.push_str(remaining);
+    result
+}
+
+/// Redact JWT tokens: eyJ<base64url>.<base64url>.<base64url>
+fn redact_jwt(s: &str) -> String {
+    const PREFIX: &[u8] = b"eyJ";
+    let bytes = s.as_bytes();
+    if !bytes.windows(3).any(|w| w == PREFIX) {
+        return s.to_owned();
+    }
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 < bytes.len() && &bytes[i..i + 3] == PREFIX {
+            let start = i;
+            i += 3;
+            let mut dots = 0usize;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b == b'.' {
+                    dots += 1;
+                    if dots > 2 {
+                        break;
+                    }
+                    i += 1;
+                } else if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'=' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if dots == 2 && i > start + 10 {
+                result.push_str("[REDACTED_JWT]");
+            } else {
+                result.push_str(&s[start..i]);
+            }
+        } else {
+            let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            result.push_str(&s[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    result
+}
+
+/// Redact AWS access key IDs: AKIA + 16 uppercase alphanumeric chars.
+fn redact_aws_akid(s: &str) -> String {
+    const PREFIX: &str = "AKIA";
+    if !s.contains(PREFIX) {
+        return s.to_owned();
+    }
+    let mut result = String::with_capacity(s.len());
+    let mut remaining = s;
+    while let Some(pos) = remaining.find(PREFIX) {
+        result.push_str(&remaining[..pos]);
+        let after = &remaining[pos..]; // includes AKIA
+        let rest = &after[4..];
+        if rest.len() >= 16
+            && rest[..16]
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        {
+            result.push_str("[REDACTED]");
+            remaining = &after[4 + 16..];
+        } else {
+            result.push_str(PREFIX);
+            remaining = &after[4..];
+        }
+    }
+    result.push_str(remaining);
+    result
+}
+
+/// Redact `key=value` for known sensitive param names.
+fn redact_key_eq_value(s: &str, key: &str) -> String {
+    if !s.contains(key) {
+        return s.to_owned();
+    }
+    let mut result = String::with_capacity(s.len());
+    let mut remaining = s;
+    while let Some(pos) = remaining.find(key) {
+        result.push_str(&remaining[..pos + key.len()]);
+        let after = &remaining[pos + key.len()..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '&' | '"' | '\'' | ',' | ')' | '}'))
+            .unwrap_or(after.len());
+        if end > 0 {
+            result.push_str("[REDACTED]");
+        }
+        remaining = &after[end..];
+    }
+    result.push_str(remaining);
+    result
+}
+
+/// Redact contiguous hex runs >= 32 chars.
+fn redact_long_hex(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_hexdigit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i - start >= 32 {
+                result.push_str("[REDACTED]");
+            } else {
+                result.push_str(&s[start..i]);
+            }
+        } else {
+            let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            result.push_str(&s[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    result
+}
+
+/// Redact contiguous base64 runs >= 32 chars that contain at least one
+/// non-hex character (A-Z, +, /, =) — avoids re-matching hex runs.
+fn redact_long_base64(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if is_b64_char(b) {
+            let start = i;
+            while i < bytes.len() && is_b64_char(bytes[i]) {
+                i += 1;
+            }
+            let run = &s[start..i];
+            if run.len() >= 32
+                && run
+                    .bytes()
+                    .any(|c| matches!(c, b'A'..=b'Z' | b'+' | b'/' | b'='))
+            {
+                result.push_str("[REDACTED]");
+            } else {
+                result.push_str(run);
+            }
+        } else {
+            let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            result.push_str(&s[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    result
+}
+
+fn is_b64_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
+}
+
+/// Redact email addresses (PII).
+fn redact_emails(s: &str) -> String {
+    if !s.contains('@') {
+        return s.to_owned();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '@' && i > 0 {
+            let local_end = i;
+            let mut local_start = local_end;
+            while local_start > 0 {
+                let c = chars[local_start - 1];
+                if c.is_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-') {
+                    local_start -= 1;
+                } else {
+                    break;
+                }
+            }
+            let domain_start = i + 1;
+            let mut domain_end = domain_start;
+            while domain_end < chars.len() {
+                let c = chars[domain_end];
+                if c.is_alphanumeric() || matches!(c, '.' | '-') {
+                    domain_end += 1;
+                } else {
+                    break;
+                }
+            }
+            let local: String = chars[local_start..local_end].iter().collect();
+            let domain: String = chars[domain_start..domain_end].iter().collect();
+            if !local.is_empty() && domain.contains('.') {
+                let local_byte_len: usize = local.bytes().count();
+                let result_len = result.len();
+                result.truncate(result_len - local_byte_len);
+                result.push_str("[REDACTED]");
+                i = domain_end;
+            } else {
+                result.push('@');
+                i += 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
 }
