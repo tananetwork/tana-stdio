@@ -25,9 +25,30 @@
 //! - `error` - Errors only
 //! - `info` - Default (startup + important messages)
 //! - `debug` - Verbose output
+//!
+//! ## Central audit sink (feature `sink`, default on)
+//!
+//! When the `sink` feature is enabled (the default), every log/error/warn/
+//! status/etc. call ALSO appends one NDJSON record to a local spool file and a
+//! background thread gzips batches and POSTs them to a central `/ingest`
+//! endpoint. Configuration is entirely environment-driven:
+//!
+//! - `DEKA_LOG_SINK`         host or URL of the ingest endpoint (e.g. `logs.tana.gg`)
+//! - `DEKA_LOG_TOKEN`        bearer token sent as `Authorization: Bearer ...`
+//! - `DEKA_LOG_SPOOL`        spool file path (default `/var/log/deka/spool`)
+//! - `DEKA_LOG_STDOUT`       set to `1` to also print to stderr (opt-in)
+//! - `DEKA_LOG_FLUSH_SECS`   background flush interval, seconds (default 5)
+//! - `DEKA_LOG_SPOOL_CAP_MB` spool size cap in MB (default 64, oldest dropped)
+//!
+//! If `DEKA_LOG_SINK` is unset, output falls back to stderr so local dev still
+//! works. Disable the sink entirely (zero dependencies) with
+//! `--no-default-features`.
 
 use std::env;
 use std::sync::OnceLock;
+
+#[cfg(feature = "sink")]
+mod sink;
 
 /// Log level for tana services
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -69,6 +90,38 @@ pub fn is_info() -> bool {
 }
 
 // ============================================================
+// Emit core — fans a single call out to the audit sink (if the
+// `sink` feature is enabled) and to stderr (when stdout is enabled).
+// ============================================================
+
+/// Emit a structured record. `display` is the human-formatted line printed to
+/// stderr; the (level, component, action, msg) tuple is what lands in the
+/// NDJSON spool. When the `sink` feature is off this just prints `display`.
+fn emit_structured(level: &str, component: &str, action: &str, msg: &str, display: &str) {
+    #[cfg(feature = "sink")]
+    {
+        let logger = sink::logger();
+        logger.append(level, component, action, msg);
+        sink::maybe_flush_for_threshold(&logger);
+        if logger.stdout_enabled() {
+            eprintln!("{}", display);
+        }
+    }
+
+    #[cfg(not(feature = "sink"))]
+    {
+        let _ = (level, component, action, msg);
+        eprintln!("{}", display);
+    }
+}
+
+/// Emit a raw (already-formatted) line with no structured metadata beyond the
+/// default component/action.
+fn emit_line(line: &str) {
+    emit_structured("info", "stdio", "raw", line, line);
+}
+
+// ============================================================
 // Core logging functions (match @tananetwork/stdio API)
 // ============================================================
 
@@ -82,7 +135,13 @@ pub fn is_info() -> bool {
 /// ```
 pub fn log(action: &str, message: &str) {
     if log_level() >= LogLevel::Info {
-        eprintln!("[{}] {}", action, message);
+        emit_structured(
+            "info",
+            action,
+            action,
+            message,
+            &format!("[{}] {}", action, message),
+        );
     }
 }
 
@@ -95,7 +154,13 @@ pub fn log(action: &str, message: &str) {
 /// // Output: [build] compilation failed
 /// ```
 pub fn error(action: &str, message: &str) {
-    eprintln!("[{}] {}", action, message);
+    emit_structured(
+        "error",
+        action,
+        action,
+        message,
+        &format!("[{}] {}", action, message),
+    );
 }
 
 /// Log a warning
@@ -107,13 +172,25 @@ pub fn error(action: &str, message: &str) {
 /// // Output: [warn] [cache] stale entries detected
 /// ```
 pub fn warn(name: &str, message: &str) {
-    eprintln!("[warn] [{}] {}", name, message);
+    emit_structured(
+        "warn",
+        name,
+        "warn",
+        message,
+        &format!("[warn] [{}] {}", name, message),
+    );
 }
 
 /// Log a simple warning without component name
 /// Format: `[warn] message`
 pub fn warn_simple(message: &str) {
-    eprintln!("[warn] {}", message);
+    emit_structured(
+        "warn",
+        "stdio",
+        "warn",
+        message,
+        &format!("[warn] {}", message),
+    );
 }
 
 /// Log a status line with success/failure indicator
@@ -126,9 +203,21 @@ pub fn warn_simple(message: &str) {
 /// ```
 pub fn status(name: &str, message: &str, ok: bool) {
     if ok {
-        eprintln!("[ok] [{}] {}", name, message);
+        emit_structured(
+            "status",
+            name,
+            "ok",
+            message,
+            &format!("[ok] [{}] {}", name, message),
+        );
     } else {
-        eprintln!("[fail] [{}] {}", name, message);
+        emit_structured(
+            "error",
+            name,
+            "fail",
+            message,
+            &format!("[fail] [{}] {}", name, message),
+        );
     }
 }
 
@@ -143,14 +232,14 @@ pub fn status(name: &str, message: &str, ok: bool) {
 /// // ----------------------------------------
 /// ```
 pub fn header(title: &str) {
-    eprintln!();
-    eprintln!("{}", title);
-    eprintln!("{}", "-".repeat(40));
+    emit_line("");
+    emit_line(title);
+    emit_line(&"-".repeat(40));
 }
 
 /// Print a blank line
 pub fn blank() {
-    eprintln!();
+    emit_line("");
 }
 
 /// Success message
@@ -162,7 +251,13 @@ pub fn blank() {
 /// // Output: [ok] build complete
 /// ```
 pub fn success(message: &str) {
-    eprintln!("[ok] {}", message);
+    emit_structured(
+        "status",
+        "stdio",
+        "ok",
+        message,
+        &format!("[ok] {}", message),
+    );
 }
 
 /// Failure message
@@ -174,7 +269,13 @@ pub fn success(message: &str) {
 /// // Output: [fail] build failed
 /// ```
 pub fn fail(message: &str) {
-    eprintln!("[fail] {}", message);
+    emit_structured(
+        "error",
+        "stdio",
+        "fail",
+        message,
+        &format!("[fail] {}", message),
+    );
 }
 
 /// Info line with label
@@ -186,19 +287,25 @@ pub fn fail(message: &str) {
 /// // Output:   port       8506
 /// ```
 pub fn info(label: &str, value: &str) {
-    eprintln!("  {:<10} {}", label, value);
+    emit_structured(
+        "info",
+        label,
+        "info",
+        value,
+        &format!("  {:<10} {}", label, value),
+    );
 }
 
 /// Hint in subdued format
 /// Format: `  message`
 pub fn hint(message: &str) {
-    eprintln!("  {}", message);
+    emit_line(&format!("  {}", message));
 }
 
 /// Detail line with arrow
 /// Format: `    -> message`
 pub fn detail(message: &str) {
-    eprintln!("    -> {}", message);
+    emit_line(&format!("    -> {}", message));
 }
 
 /// Suggest a next step
@@ -210,13 +317,19 @@ pub fn detail(message: &str) {
 /// // Output:   -> start the server: npm run dev
 /// ```
 pub fn next_step(description: &str, command: &str) {
-    eprintln!("  -> {}: {}", description, command);
+    emit_line(&format!("  -> {}: {}", description, command));
 }
 
 /// Diagnostic warning
 /// Format: `[warn] [component] message`
 pub fn diagnostic(component: &str, message: &str) {
-    eprintln!("[warn] [{}] {}", component, message);
+    emit_structured(
+        "warn",
+        component,
+        "diagnostic",
+        message,
+        &format!("[warn] [{}] {}", component, message),
+    );
 }
 
 // ============================================================
@@ -232,8 +345,19 @@ pub fn diagnostic(component: &str, message: &str) {
 /// ```
 pub fn debug(action: &str, message: &str) {
     if log_level() >= LogLevel::Debug {
-        eprintln!("[{}] {}", action, message);
+        emit_structured(
+            "debug",
+            action,
+            action,
+            message,
+            &format!("[{}] {}", action, message),
+        );
     }
+}
+
+/// Print a raw line (no extra formatting).
+pub fn raw(message: &str) {
+    emit_line(message);
 }
 
 // ============================================================
@@ -250,7 +374,7 @@ pub fn debug(action: &str, message: &str) {
 macro_rules! logf {
     ($action:expr, $($arg:tt)*) => {
         if $crate::log_level() >= $crate::LogLevel::Info {
-            eprintln!(concat!("[", $action, "] {}"), format!($($arg)*));
+            $crate::log($action, &format!($($arg)*));
         }
     };
 }
@@ -259,7 +383,7 @@ macro_rules! logf {
 #[macro_export]
 macro_rules! errorf {
     ($action:expr, $($arg:tt)*) => {
-        eprintln!(concat!("[", $action, "] {}"), format!($($arg)*));
+        $crate::error($action, &format!($($arg)*));
     };
 }
 
@@ -268,7 +392,7 @@ macro_rules! errorf {
 macro_rules! debugf {
     ($action:expr, $($arg:tt)*) => {
         if $crate::log_level() >= $crate::LogLevel::Debug {
-            eprintln!(concat!("[", $action, "] {}"), format!($($arg)*));
+            $crate::debug($action, &format!($($arg)*));
         }
     };
 }

@@ -1,6 +1,6 @@
 {
   "name": "@tananetwork/stdio",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Terminal output utilities for Tana projects",
   "type": "module",
   "main": "dist/index.js",
@@ -16,6 +16,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "test": "bun test",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
