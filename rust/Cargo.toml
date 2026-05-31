@@ -1,6 +1,6 @@
 [package]
 name = "tana-stdio"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Terminal output utilities for Tana projects"
 license = "MIT"
@@ -10,6 +10,22 @@ categories = ["command-line-interface", "development-tools"]
 authors = ["Tana Network"]
 
 [dependencies]
+# Central audit sink dependencies. Kept deliberately light: a blocking HTTP
+# client (ureq) instead of reqwest+tokio, plus serde_json/flate2/chrono.
+# All optional and gated behind the (default-on) `sink` feature so the
+# formatting-only use of this crate still compiles with zero dependencies via
+# `--no-default-features`.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
+flate2 = { version = "1.0", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+ureq = { version = "2.10", default-features = false, features = ["tls"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
-default = []
+default = ["sink"]
+# Enables the central audit log sink (spool file + gzip batch flush to /ingest).
+# Disable with --no-default-features for a pure formatting build (no deps).
+sink = ["dep:chrono", "dep:flate2", "dep:serde", "dep:serde_json", "dep:ureq"]
